@@ -1,0 +1,189 @@
+library('readxl')
+library('lubridate')
+library('MASS')
+library('sn')
+library('e1071')
+library('tseries')
+library('extRemes')
+library('evir')
+library('rugarch')
+library('GAS')
+library('data.table')
+library(tidyquant)
+options("getSymbols.warning4.0"=FALSE)
+options("getSymbols.yahoo.warning"=FALSE)
+library("TSA")
+library("fGarch")
+library("tseries")
+require(rugarch)
+library("GAS")
+library(QRM)
+library("aTSA")
+?tq_get
+#data
+#####Taking the data and making the plot 
+Data <- tq_get('^GSPC',from = "2000-01-01",to ="2020-01-01",get = "stock.prices",collaps = "daily")
+Date <- as.Date(Data$date)
+BC<-Data$close
+length(BC)
+plot(Date,BC,type='l')
+
+
+
+######log returns r_b
+r_b<-log(BC[-1]/BC[-length(BC)])*100
+insample<-r_b[1:4492] #the data in which we will base the VaR estimates 
+outofsample<-r_b[(length(r_b)-999):length(r_b)] #creating the data for the backtest
+plot(Date[1:length(insample)],insample,type='l',main='logret S&P 500,2000/01/03-2017/11/07',ylab='log ret S&P 500',xlab='Date') #plot of log returns
+ 
+
+
+#####discribe statistics
+summary(insample)
+sd(insample)
+skewness(insample)
+kurtosis(insample)
+adf.test(insample)
+
+
+
+#####GARCH NORM
+#norm
+armaOrder <- c(0,0) # ARMA order
+garchOrder <- c(1,1) # GARCH order
+varModel <- list(model = "sGARCH", garchOrder = garchOrder)
+garchspec <- ugarchspec(varModel, mean.model = list(armaOrder = armaOrder), distribution.model = "norm")
+fit_GN<-ugarchfit(data=insample,spec=garchspec)
+plot(insample/sigma(fit_GN))
+residuals_f <- residuals(fit_GN, standardize= TRUE)
+
+
+
+
+
+#fit GPD
+#declaring the threshold for the General Pareto Distribution
+MEplot(insample[insample>0], main="Mean-Excess Dow Jones", xlab="GPD Threshold") 
+legend("topleft", expression("u=2.8"), lty= 1, lwd=2.5,col="red")
+abline(v=1, col="red") 
+u <- 0.5
+plotFittedGPDvsEmpiricalExcesses(insample, threshold=0.5) #goodness of fit
+
+
+
+### Transforming Garch to just "Z" NORMAL
+Z.GAR.N <- insample / as.numeric(sigma(fit_GN))
+Box.test(Z.GAR.N, lag= 5, type="Ljung-Box")
+plot(Date[1:4492], Z.GAR.N, "l")
+
+
+#threshold for G.GAR models with NORMAL distribution 
+MEplot(Z.GAR.N[Z.GAR.N>0], main="Mean-Excess,insample-GARCH", xlab="insample-GARCH(1,1) Threshold")
+legend("topleft", expression("u=1.3"), lty= 1, lwd=2.5,col="red")
+abline(v=1.3, col="red")
+u.GAR.N <- 1.3
+plotFittedGPDvsEmpiricalExcesses(Z.GAR.N, threshold=1.3) #goodness of fit
+
+
+#creating a path for possible future values of the stock using GARCH model. 
+simgarchspec <- garchspec
+setfixed(simgarchspec) <- as.list(coef(fit_GN))
+outofsamples <- ugarchpath(spec = simgarchspec, m.sim = 1,
+                                      n.sim = 1000, rseed = 12345)
+outofsample<-fitted(outofsamples)
+
+
+
+#calculating the var for 0.99 confidence level
+
+
+
+#Var GPD 
+p<-0.99
+xi.GPD <- fit.GPD(insample, threshold = u)$par.ests[1];
+beta.GPD<- fit.GPD(insample, threshold = u)$par.ests[2]
+VaR.GPD <- u + beta.GPD / xi.GPD *
+  ((fit.GPD(insample, threshold=u)$n /
+      fit.GPD(insample, threshold=u)$n.exceed *(1-p))^-xi.GPD -1)
+      
+      
+#Var Quantile (the simpliest way of calculating the VaR taking the empirical distribution)
+VaR.quan <- quantile(insample, p)      
+      
+#Var Normal (assuming that the log returns are following a Normal Distribution with mu, and sigma calculated from the insample data)
+mu.norm <- mean(insample); sigma.norm <- sd(insample)
+VaR.norm <- qnorm(p, mu.norm, sigma.norm)
+
+
+#Var Garch normal
+xi.Gar.GPD.N <- fit.GPD(Z.GAR.N, threshold = u.GAR.N)$par.ests[1];
+beta.Gar.GPD.N<- fit.GPD(Z.GAR.N, threshold = u.GAR.N)$par.ests[2]
+
+VaR.GAR.ZN <- u.GAR.N + beta.Gar.GPD.N / xi.Gar.GPD.N *
+  ((fit.GPD(Z.GAR.N, threshold=u.GAR.N)$n /
+      fit.GPD(Z.GAR.N, threshold=u.GAR.N)$n.exceed *(1-p))^-xi.Gar.GPD.N -1) #calculate the sigma which is needed to find the next days VaR
+
+
+#VAR GAR FUTURE (the GAR estimate for the next 1000 days)
+Var.GAR.Fut.N <- sigma(outofsamples) * VaR.GAR.ZN
+
+
+#Calculate the number of exceedances for every method
+
+exc.garn<-sum(Var.GAR.Fut.N<outofsample)#
+exc.qq<-sum(VaR.quan<outofsample)#
+exc.gev<-sum(VaR.GPD<outofsample)#
+exc.norm<-sum(VaR.norm<outofsample)
+
+
+#Calculate the avg exceedances of our estimates
+x.gev <- 0
+for(i in 1:1000){
+  if(outofsample[i] > VaR.GPD){
+    x.gev <-x.gev +outofsample[i]-VaR.GPD 
+  }}
+Avg.Exc.GEV <- x.gev / exc.gev
+
+
+x.norm <- 0
+for(i in 1:1000){
+  if(outofsample[i] > VaR.norm){
+    x.norm <-x.qq +outofsample[i]-VaR.norm 
+  }}
+Avg.Exc.norm <- x.norm / exc.norm
+
+
+x.qq <- 0
+for(i in 1:1000){
+  if(outofsample[i] > VaR.GPD){
+    x.qq <-x.qq +outofsample[i]-VaR.quan 
+  }}
+Avg.Exc.GEV <- x.qq / exc.qq
+
+
+
+x.garn <- 0
+for(i in 1:1000){
+  if(outofsample[i] > Var.GAR.Fut.N[i]){
+    x.garn <-x.gars +outofsample[i]-Var.GAR.Fut.N[i] }}
+Avg.Exc.GAR.N <- x.garn / exc.garn
+Avg.Exc.GAR.N
+
+
+#The binomial test for the accuracy of our estimates
+1-pbinom(exc.garn, 1000, 1-p);
+1-pbinom(exc.qq, 1000, 1-p); 
+1-pbinom(exc.gev, 1000, 1-p);
+1-pbinom(exc.norm,1000,1-p);
+
+
+#CAVIAR (an axtion for the instalization of the packages is needed to use the CaviarOptim function)
+#MODELO 1
+cav_garch.1<-vector()
+for(i in (length(r_b)-1000):(length(r_b)-1)){
+  serie<-r_b[(i-500+1):i]
+  modelo<-caviarOptim(serie,model=1,pval=0.05)
+  cav_garch.1[i-4482+1]<-modelo$VarPredict
+}
+
+
